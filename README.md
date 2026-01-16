@@ -1,5 +1,5 @@
 # StreamGuard: Self-Hosted LLM Streaming Cost Control & Cancellation
-============================================================
+
 
 ### Problem
 
