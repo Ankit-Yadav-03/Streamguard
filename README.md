@@ -1,121 +1,134 @@
-# StreamGuard: Self-Hosted LLM Streaming Cost Control & Cancellation
+**StreamGuard**
+================
 
+### Self-Hosted LLM Streaming Control Plane
 
-### Problem
+#### Problem
 
-LLM streaming continues **after clients disconnect**, leading to:
+LLM streaming systems often continue generating or committing tokens after clients disconnect, leading to:
 
 * Silent token burn
-* Unpredictable invoices
-* No audit trail
-* Discovery only after the bill arrives
+* Unbounded buffering under slow consumers
+* Inaccurate or delayed cost attribution
+* Discovery only after invoices arrive
 
-Most teams notice this only when finance asks questions.
+Most teams notice the problem only when finance escalates.
 
-### Solution: What StreamGuard Does
+### What StreamGuard Is
 
-StreamGuard is a **self-hosted streaming control plane** that prevents token bleed during LLM streaming. It:
+StreamGuard is a self-hosted streaming control plane that enforces correct lifecycle semantics for LLM token
+streams. It:
 
-* Guarantees immediate cancellation on client disconnect
-* Provides bounded backpressure
-* Ensures strict accounting cutoffs
-* Generates audit-grade receipts proving prevented spend
+* Does not generate tokens
+* Governs how tokens flow, terminate, and are accounted for
 
 You keep:
+
 * Your infrastructure
 * Your API keys
 * Your models
 * Your data
 
+### What StreamGuard Guarantees
+
+StreamGuard enforces the following protocol-level guarantees:
+
+* Hard accounting cutoff after cancellation or shutdown
+* No token commitment after cutoff, even if producers misbehave
+* Bounded buffering and backpressure during streaming
+* Explicit, deterministic stream completion (EOS)
+* No ACK-dependent deadlocks (slow consumers are safe)
+* Correct attribution of termination cause
+* Immutable, auditable receipts
+
+These guarantees are validated against real streaming LLMs (Ollama) and enforced by tests, not heuristics.
+
 ### What StreamGuard Is Not
 
-* Not a hosted proxy
-* Not a model wrapper
-* Not a prompt framework
-* Not post-hoc observability
+Not a:
 
-StreamGuard controls **stream lifecycle**, not prompts.
+* Hosted proxy
+* Model wrapper
+* Prompt framework
+* Post-hoc observability
 
-### Core Guarantees
+StreamGuard controls stream lifecycle, not prompts or model internals.
 
-* No token generation after client disconnect
-* No unbounded buffering
-* No silent accounting drift
-* Deterministic shutdown
-* Immutable financial receipts
+### Architecture (High-Level)
 
-All guarantees are validated against a **real streaming LLM (Ollama)**.
+StreamGuard separates responsibilities explicitly:
 
-### Producer Model (Key Concept)
+* Producer: generates tokens (LLM, API, or internal system)
+* Dispatcher: enforces backpressure, ordering, and finalization
+* Consumer: reads committed tokens
+* Protocol: defines cancellation, completion, and correctness
+* Session: orchestrates lifecycle and accounting
 
-StreamGuard does **not** generate tokens. It consumes tokens from a **producer object**, which is any object that
-implements a single async method:
+This separation is what makes correctness provable.
+
+### Producer Model
+
+A producer is any object implementing:
 
 ```python
-import asyncio
-
-class MyProducer:
-    async def run(
-        self,
-        *,
-        out_q: asyncio.Queue[str],
-        cancel_event: asyncio.Event,
-        stats: dict,
-    ) -> None:
-        ...
+async def run(*, out, cancel_event) -> None:
+    ...
 ```
 
-The producer object is passed to a StreamSession at creation time.
+Rules:
 
-### Producer Rules
-
+* MUST emit tokens via `out(token)`
 * MUST stop promptly when `cancel_event` is set
-* MUST emit tokens incrementally
-* MUST NOT manage buffering or backpressure
-* MAY raise → the stream is cancelled safely
+* MUST NOT emit EOS
+* MUST NOT manage buffering or accounting
+* MAY raise → stream aborts safely
 
-This makes StreamGuard compatible with:
+Producers are wrapped by an adapter that enforces protocol semantics.
 
-* OpenAI
-* Anthropic
+### Compatible with:
+
 * Ollama
-* internal LLMs
+* OpenAI-style streaming
+* Anthropic-style streaming
+* Internal LLMs
 
-### Example: Using an Open-Source LLM (Ollama)
-
-StreamGuard has been validated against Ollama (local, no API keys):
-
+### Example: Streaming with Ollama
 ```python
-import asyncio
-
 producer = OllamaProducer(
     model="llama3",
-    prompt="Explain backpressure in async systems.",
+    prompt="Explain backpressure in distributed systems.",
 )
 
 session = StreamSession(
     producer=producer,
-    N=5,
-    M=2,
-    stats={},
+    speculative_buffer_limit=8,
+    max_inflight_commits=16,
 )
 
 session.start()
 ```
 
-Disconnecting the client mid-stream:
+### Cancellation vs Shutdown (Important)
 
-* Stops token generation immediately
-* Issues a receipt showing prevented spend
+StreamGuard distinguishes intent from authority:
 
-### Cancellation vs Shutdown
+* Client disconnect → protocol-level cancellation intent
+* Protocol cancellation → authoritative abort with USER attribution
+* Shutdown → authoritative fallback if nothing else has terminated the stream
 
-StreamGuard separates concerns intentionally:
+Shutdown never overrides an existing terminal cause.
 
-* `cancel()`: Cuts accounting and lifecycle immediately.
-* `shutdown()`: Terminates background tasks safely.
+This prevents silent cost bleed while preserving correct attribution.
 
-This prevents silent cost bleed while ensuring clean teardown.
+### End-of-Stream (EOS)
+
+Stream completion is explicit.
+
+* EOS is emitted exactly once
+* EOS does not depend on consumer ACKs
+* EOS is delivered after all committed tokens
+
+Consumers must stop reading on EOS.
 
 ### Receipts
 
@@ -125,14 +138,17 @@ Each stream produces an immutable receipt containing:
 * Tokens committed
 * Tokens consumed
 * Estimated prevented tokens
-* Cancellation reason and category
+* Termination reason and category
 * Lifecycle timestamps
 
 Receipts are financial artifacts, not logs.
 
 ### Intended Users
 
-* B2B SaaS with chat or copilots
+B2B SaaS with chat or copilots
+
 * Internal AI tooling teams
 * Platform / infra engineers
-* Teams paying real LLM invoices (if token costs matter)
+* Teams paying real LLM invoices
+
+If token costs matter, lifecycle correctness matters.
