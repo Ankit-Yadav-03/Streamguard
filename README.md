@@ -5,22 +5,19 @@
 
 #### Problem
 
-LLM streaming systems often continue generating or committing tokens after clients disconnect, leading to:
+LLM streaming systems often keep producing or forwarding tokens after users disconnect. That creates:
 
 * Silent token burn
-* Unbounded buffering under slow consumers
-* Inaccurate or delayed cost attribution
-* Discovery only after invoices arrive
-
-Most teams notice the problem only when finance escalates.
+* Buffer growth under slow consumers
+* Weak cancellation attribution
+* Hard-to-explain cost deltas after invoices arrive
 
 ### What StreamGuard Is
 
-StreamGuard is a self-hosted streaming control plane that enforces correct lifecycle semantics for LLM token
-streams. It:
+StreamGuard is a self-hosted stream lifecycle layer for token streaming systems. It:
 
 * Does not generate tokens
-* Governs how tokens flow, terminate, and are accounted for
+* Coordinates token flow, cancellation, completion, and accounting
 
 You keep:
 
@@ -29,46 +26,41 @@ You keep:
 * Your models
 * Your data
 
-### What StreamGuard Guarantees
+### What StreamGuard Enforces
 
-StreamGuard enforces the following protocol-level guarantees:
+At protocol level, StreamGuard is built to enforce:
 
-* Hard accounting cutoff after cancellation or shutdown
-* No token commitment after cutoff, even if producers misbehave
-* Bounded buffering and backpressure during streaming
-* Explicit, deterministic stream completion (EOS)
-* No ACK-dependent deadlocks (slow consumers are safe)
-* Correct attribution of termination cause
-* Immutable, auditable receipts
+* Fast cancellation propagation through session, dispatcher, and producer adapter
+* Bounded in-memory buffering and explicit backpressure limits
+* Explicit stream completion via EOS in non-abort paths
+* Accounting invariants (`produced >= committed >= consumed`)
+* Per-stream receipts with lifecycle timestamps and token counts
 
-These guarantees are validated against real streaming LLMs (Ollama) and enforced by tests, not heuristics.
+These properties are covered by unit/integration tests in this repo and an Ollama integration example.
 
-### What StreamGuard Is Not
+### What StreamGuard Does Not Claim
 
-Not a:
+StreamGuard does not currently claim:
 
-* Hosted proxy
-* Model wrapper
-* Prompt framework
-* Post-hoc observability
-
-StreamGuard controls stream lifecycle, not prompts or model internals.
+* Universal provider-side billing guarantees
+* Cryptographic immutability of receipt files
+* Native production adapters for every provider out of the box
 
 ### Architecture (High-Level)
 
-StreamGuard separates responsibilities explicitly:
+StreamGuard separates responsibilities:
 
-* Producer: generates tokens (LLM, API, or internal system)
-* Dispatcher: enforces backpressure, ordering, and finalization
-* Consumer: reads committed tokens
-* Protocol: defines cancellation, completion, and correctness
-* Session: orchestrates lifecycle and accounting
+* Producer: emits tokens from your model/API
+* ProducerAdapter: enforces cancellation-aware emission semantics
+* Dispatcher: handles buffering, commit flow, and terminal transitions
+* Consumer handle: reads committed tokens and emits consumption events
+* Session: orchestrates lifecycle and final receipt accounting
 
-This separation is what makes correctness provable.
+This separation is what makes behavior inspectable and testable.
 
-### Producer Model
+### Producer Contract
 
-A producer is any object implementing:
+A producer implements:
 
 ```python
 async def run(*, out, cancel_event) -> None:
@@ -78,77 +70,57 @@ async def run(*, out, cancel_event) -> None:
 Rules:
 
 * MUST emit tokens via `out(token)`
-* MUST stop promptly when `cancel_event` is set
+* SHOULD stop promptly when `cancel_event` is set
 * MUST NOT emit EOS
-* MUST NOT manage buffering or accounting
-* MAY raise → stream aborts safely
+* MUST NOT manage StreamGuard accounting
 
-Producers are wrapped by an adapter that enforces protocol semantics.
+Producers are wrapped by `ProducerAdapter` for protocol alignment.
 
-### Compatible with:
+### Integrations
 
-* Ollama
-* OpenAI-style streaming
-* Anthropic-style streaming
-* Internal LLMs
+Included now:
 
-### Example: Streaming with Ollama
-```python
-producer = OllamaProducer(
-    model="llama3",
-    prompt="Explain backpressure in distributed systems.",
-)
+* Ollama streaming provider example
+* FastAPI HTTP streaming endpoint
+* FastAPI WebSocket endpoint
 
-session = StreamSession(
-    producer=producer,
-    speculative_buffer_limit=8,
-    max_inflight_commits=16,
-)
+Pluggable pattern supports adding providers with the same `run(out, cancel_event)` contract.
 
-session.start()
-```
+### Cancellation and Shutdown
 
-### Cancellation vs Shutdown (Important)
+StreamGuard distinguishes cancellation intent from terminal shutdown:
 
-StreamGuard distinguishes intent from authority:
+* Client disconnect triggers cancellation intent
+* Session abort path records terminal reason/category
+* Shutdown acts as terminal fallback when no terminal state was observed yet
 
-* Client disconnect → protocol-level cancellation intent
-* Protocol cancellation → authoritative abort with USER attribution
-* Shutdown → authoritative fallback if nothing else has terminated the stream
-
-Shutdown never overrides an existing terminal cause.
-
-This prevents silent cost bleed while preserving correct attribution.
+This helps reduce post-disconnect token flow and improves lifecycle attribution quality.
 
 ### End-of-Stream (EOS)
 
-Stream completion is explicit.
+In completion paths:
 
-* EOS is emitted exactly once
-* EOS does not depend on consumer ACKs
-* EOS is delivered after all committed tokens
-
-Consumers must stop reading on EOS.
+* EOS is emitted once
+* EOS is emitted after committed tokens are drained
+* Aborted streams do not emit EOS
 
 ### Receipts
 
-Each stream produces an immutable receipt containing:
+Each stream produces a receipt with:
 
-* Tokens produced
-* Tokens committed
-* Tokens consumed
-* Estimated prevented tokens
-* Termination reason and category
-* Lifecycle timestamps
+* `produced`, `committed`, `consumed`
+* `estimated_prevented`
+* cancel reason/category
+* lifecycle timestamps
 
-Receipts are financial artifacts, not logs.
+Receipts are persisted as append-only JSONL records in the example app.
 
 ### Intended Users
 
-B2B SaaS with chat or copilots
+Teams running production or pre-production LLM streaming workloads:
 
-* Internal AI tooling teams
-* Platform / infra engineers
-* Teams paying real LLM invoices
+* AI platform engineers
+* Infra/backend teams owning stream reliability
+* Product teams needing cancellation-aware cost controls
 
-If token costs matter, lifecycle correctness matters.
+If stream lifecycle correctness affects your cost and reliability, StreamGuard is designed for that layer.
