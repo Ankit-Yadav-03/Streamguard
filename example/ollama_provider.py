@@ -1,4 +1,4 @@
-# stream_guard/providers/ollama_provider.py
+# example/ollama_provider.py
 
 import aiohttp
 import asyncio
